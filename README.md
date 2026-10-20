@@ -7,7 +7,6 @@ This project contains a React/Vite UI, Express API gateway, and FastAPI inferenc
 The ZIP contains an empty `model/` placeholder, not trained weights. Set `LORA_MODEL_DIR` in a root `.env` file to the `model` directory produced by your existing `finetune.py`.
 
 ```dotenv
-LORA_MODEL_DIR="C:/Users/Sandip Patel/Desktop/Code_Play_Ground_2/play-ground/AI Code Generation System/model"
 BASE_MODEL_NAME="Qwen/Qwen2.5-Coder-0.5B-Instruct"
 FASTAPI_URL="http://127.0.0.1:8000"
 REQUIRE_LORA="1"
