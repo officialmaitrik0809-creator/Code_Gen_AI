@@ -1,21 +1,28 @@
 /**
  * Express Full-Stack Server & API Gateway
- * Bridges frontend with Python FastAPI (Qwen2.5-Coder-0.5B-Instruct + LoRA)
- * and provides Gemini Demo fallback generator when local Python backend is offline.
+ * Bridges the frontend with the Hugging Face Space
+ * (Qwen2.5-Coder-0.5B-Instruct + LoRA adapter) and provides an optional
+ * Gemini demo generator.
  */
+
 import express from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI } from '@google/genai';
+import { Client } from '@gradio/client';
 
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
 const isProd = process.env.NODE_ENV === 'production';
 const PORT = Number(process.env.PORT) || 3000;
-const FASTAPI_URL = process.env.FASTAPI_URL || 'http://127.0.0.1:8000';
+
+// Hugging Face Space that hosts the fine-tuned model
+const HF_SPACE = process.env.HF_SPACE || 'maituaesthetic/code-gen-ai-model';
+const HF_TOKEN = process.env.HF_TOKEN as `hf_${string}` | undefined;
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -31,45 +38,54 @@ if (apiKey) {
   }
 }
 
+// Connect to the Space lazily and reuse the connection
+let spaceClient: Client | null = null;
+async function getSpaceClient(): Promise<Client> {
+  if (!spaceClient) {
+    spaceClient = await Client.connect(HF_SPACE, HF_TOKEN ? { hf_token: HF_TOKEN } : {});
+  }
+  return spaceClient;
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Timed out after ${ms / 1000}s`)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
+
 /**
  * GET /api/health
- * Checks live connection to Python FastAPI backend
+ * Checks the connection to the Hugging Face Space
  */
-app.get("/api/health", (_req, res) => {
-  res.status(200).json({
-    success: true,
-    status: "API is running",
-  });
-});
-
-    if (response.ok) {
-      const data = await response.json();
-      const modelReady = data.status === 'ready' && (!data.require_lora || data.is_lora_loaded);
-      return res.json({
-        status: modelReady ? 'ready' : (data.status === 'error' ? 'error' : 'unavailable'),
-        backend: 'fastapi',
-        url: FASTAPI_URL,
-        model: data.model || 'Qwen/Qwen2.5-Coder-0.5B-Instruct',
-        lora: data.is_lora_loaded ? data.lora : 'Adapter not loaded',
-        device: data.device || 'cuda/cpu',
-        isDemoAvailable: !!aiClient,
-        details: data,
-      });
-    } else {
-      return res.json({
-        status: 'unavailable',
-        backend: 'fastapi',
-        url: FASTAPI_URL,
-        message: `FastAPI responded with HTTP ${response.status}`,
-        isDemoAvailable: !!aiClient,
-      });
-    }
+app.get('/api/health', async (_req, res) => {
+  try {
+    await withTimeout(getSpaceClient(), 60000);
+    return res.json({
+      status: 'ready',
+      backend: 'huggingface-space',
+      url: HF_SPACE,
+      model: 'Qwen/Qwen2.5-Coder-0.5B-Instruct',
+      lora: 'fine_tuned_model',
+      device: 'zerogpu',
+      isDemoAvailable: !!aiClient,
+    });
   } catch (error: any) {
+    spaceClient = null;
     return res.json({
       status: 'unavailable',
       backend: 'offline',
-      url: FASTAPI_URL,
-      message: `Could not connect to FastAPI server at ${FASTAPI_URL}. Ensure uvicorn is running.`,
+      url: HF_SPACE,
+      message: `Could not reach Hugging Face Space ${HF_SPACE}: ${error?.message}`,
       isDemoAvailable: !!aiClient,
     });
   }
@@ -85,8 +101,8 @@ app.get('/api/model-info', (_req, res) => {
     parameters: '490 Million',
     fineTuningMethod: 'LoRA (Low-Rank Adaptation, PEFT)',
     loraConfig: {
-      r: 16,
-      lora_alpha: 32,
+      r: 8,
+      lora_alpha: 16,
       lora_dropout: 0.05,
       target_modules: ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj'],
       bias: 'none',
@@ -94,14 +110,14 @@ app.get('/api/model-info', (_req, res) => {
     },
     dataset: 'CodeAlpaca_20k',
     languagesSupported: ['Python', 'JavaScript', 'Java', 'C++', 'C'],
-    frameworks: ['PyTorch 2.x', 'Hugging Face Transformers', 'PEFT', 'FastAPI', 'Uvicorn'],
-    backendUrl: FASTAPI_URL,
+    frameworks: ['PyTorch 2.x', 'Hugging Face Transformers', 'PEFT', 'Gradio'],
+    backendUrl: HF_SPACE,
   });
 });
 
 /**
  * POST /api/generate
- * Generates code from natural language instruction
+ * Generates code from a natural language instruction
  */
 app.post('/api/generate', async (req, res) => {
   const { prompt, language = 'Python', mode = 'auto', temperature = 0.2, maxTokens = 1024 } = req.body;
@@ -110,53 +126,33 @@ app.post('/api/generate', async (req, res) => {
     return res.status(400).json({ error: 'Validation Error', message: 'Prompt cannot be empty.' });
   }
 
-  // 1. Try FastAPI if mode is 'auto' or 'fastapi'
+  // 1. Hugging Face Space (the fine-tuned model) for 'auto' or 'fastapi' mode
   if (mode === 'fastapi' || mode === 'auto') {
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 60000);
-      const response = await fetch(`${FASTAPI_URL}/generate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          prompt: prompt.trim(),
-          language,
-          temperature,
-          max_tokens: maxTokens,
-        }),
-        signal: controller.signal,
+      const start = Date.now();
+      const client = await withTimeout(getSpaceClient(), 60000);
+      const result: any = await withTimeout(
+        client.predict('/generate_code', [`${prompt.trim()} (in ${language})`]),
+        120000
+      );
+      return res.json({
+        code: String(result?.data?.[0] ?? ''),
+        language,
+        engine: 'hf-space-qwen-lora',
+        model: 'Qwen/Qwen2.5-Coder-0.5B-Instruct + LoRA',
+        durationMs: Date.now() - start,
       });
-      clearTimeout(timeout);
-
-      if (response.ok) {
-        const data = await response.json();
-        return res.json({
-          code: data.code,
-          language: data.language || language,
-          engine: 'fastapi-qwen-lora',
-          model: 'Qwen/Qwen2.5-Coder-0.5B-Instruct + LoRA',
-          durationMs: data.duration_ms,
-        });
-      } else if (mode === 'fastapi') {
-        const errText = await response.text();
-        return res.status(response.status).json({
-          error: 'FastAPI Generation Error',
-          message: errText || 'FastAPI failed to generate code.',
-        });
-      }
     } catch (err: any) {
-      if (mode === 'fastapi') {
-        return res.status(503).json({
-          error: 'Backend Connection Failed',
-          message: `Could not reach local FastAPI server at ${FASTAPI_URL}. Please start your Python backend or switch to Demo Mode.`,
-          solution: 'Run: uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload',
-        });
-      }
-      // Do not silently substitute another model when the local model is unavailable.
+      spaceClient = null; // reconnect on the next request
+      return res.status(503).json({
+        error: 'Backend Connection Failed',
+        message: `Could not get a response from the Hugging Face Space ${HF_SPACE}: ${err?.message}`,
+        solution: 'Check that the Space is Running, HF_TOKEN is set on Render, and try again (the Space may be waking up).',
+      });
     }
   }
 
-  // 2. Demo generator fallback (using Gemini API configured in environment)
+  // 2. Demo generator (Gemini) - only when explicitly selected
   if (mode === 'demo' && aiClient) {
     try {
       const startTime = Date.now();
@@ -173,28 +169,23 @@ Rules:
 
       const response = await aiClient.models.generateContent({
         model: 'gemini-2.5-flash',
-        contents: [
-          { role: 'user', parts: [{ text: `${systemInstruction}\n\n${userInstruction}` }] }
-        ],
+        contents: [{ role: 'user', parts: [{ text: `${systemInstruction}\n\n${userInstruction}` }] }],
         config: {
           temperature: temperature,
           maxOutputTokens: maxTokens,
-        }
+        },
       });
 
-      let rawText = response.text || '';
-      // Strip markdown code fences if wrapped
-      rawText = rawText.trim();
+      let rawText = (response.text || '').trim();
       const codeBlockMatch = rawText.match(/^```(?:[a-zA-Z0-9_\-+]+)?\n([\s\S]*?)```$/);
       const cleanedCode = codeBlockMatch ? codeBlockMatch[1] : rawText;
 
-      const durationMs = Date.now() - startTime;
       return res.json({
         code: cleanedCode,
         language,
         engine: 'demo-gemini-bridge',
         model: 'Demo Engine (Gemini 2.5 Flash as Qwen2.5-Coder bridge)',
-        durationMs,
+        durationMs: Date.now() - startTime,
         isDemo: true,
       });
     } catch (geminiError: any) {
@@ -207,12 +198,11 @@ Rules:
 
   return res.status(503).json({
     error: 'No Backend Available',
-    message: 'Local FastAPI backend is not connected and no demo key is available. Please start the Python backend.',
-    solution: 'Run: uvicorn backend.main:app --port 8000',
+    message: 'The model backend is not available and no demo key is configured.',
   });
 });
 
-// Mount Vite or static build
+// Mount Vite (dev) or the static build (production)
 async function startServer() {
   if (!isProd) {
     const { createServer: createViteServer } = await import('vite');
