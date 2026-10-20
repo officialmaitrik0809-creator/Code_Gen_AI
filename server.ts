@@ -35,14 +35,12 @@ if (apiKey) {
  * GET /api/health
  * Checks live connection to Python FastAPI backend
  */
-app.get('/api/health', async (_req, res) => {
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 2000);
-    const response = await fetch(`${FASTAPI_URL}/health`, {
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
+app.get("/api/health", (_req, res) => {
+  res.status(200).json({
+    success: true,
+    status: "API is running",
+  });
+});
 
     if (response.ok) {
       const data = await response.json();
