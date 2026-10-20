@@ -1,0 +1,6 @@
+{
+  "name": "CodeGen AI",
+  "description": "AI Code Generation System powered by fine-tuned Qwen2.5-Coder and LoRA on CodeAlpaca_20k",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
