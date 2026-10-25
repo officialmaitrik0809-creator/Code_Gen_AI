@@ -13,6 +13,47 @@ import { GoogleGenAI } from '@google/genai';
 import { Client } from '@gradio/client';
 
 dotenv.config();
+import pg from 'pg';
+
+const pool = process.env.DATABASE_URL
+  ? new pg.Pool({ connectionString: process.env.DATABASE_URL })
+  : null;
+
+async function initDb() {
+  if (!pool) {
+    console.warn('DATABASE_URL not set - saving history is disabled');
+    return;
+  }
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS generations (
+      id SERIAL PRIMARY KEY,
+      prompt TEXT NOT NULL,
+      language TEXT,
+      output TEXT NOT NULL,
+      engine TEXT,
+      model TEXT,
+      duration_ms INTEGER,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+}
+
+async function saveGeneration(row: {
+  prompt: string; language: string; output: string;
+  engine: string; model: string; durationMs?: number;
+}) {
+  if (!pool) return;
+  try {
+    await pool.query(
+      `INSERT INTO generations (prompt, language, output, engine, model, duration_ms)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [row.prompt, row.language, row.output, row.engine, row.model,
+       row.durationMs != null ? Math.round(row.durationMs) : null]
+    );
+  } catch (err) {
+    console.error('DB save failed:', err);
+  }
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
