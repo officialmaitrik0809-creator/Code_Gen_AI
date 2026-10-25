@@ -11,10 +11,13 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI } from '@google/genai';
 import { Client } from '@gradio/client';
-
-dotenv.config();
 import pg from 'pg';
 
+dotenv.config();
+
+// ---------------------------------------------------------------------------
+// Database (Postgres, e.g. Neon) - saves every prompt and model output
+// ---------------------------------------------------------------------------
 const pool = process.env.DATABASE_URL
   ? new pg.Pool({ connectionString: process.env.DATABASE_URL })
   : null;
@@ -36,21 +39,33 @@ async function initDb() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+  console.log('Database ready: generations table OK');
 }
 
 async function saveGeneration(row: {
-  prompt: string; language: string; output: string;
-  engine: string; model: string; durationMs?: number;
+  prompt: string;
+  language: string;
+  output: string;
+  engine: string;
+  model: string;
+  durationMs?: number;
 }) {
   if (!pool) return;
   try {
     await pool.query(
       `INSERT INTO generations (prompt, language, output, engine, model, duration_ms)
        VALUES ($1, $2, $3, $4, $5, $6)`,
-      [row.prompt, row.language, row.output, row.engine, row.model,
-       row.durationMs != null ? Math.round(row.durationMs) : null]
+      [
+        row.prompt,
+        row.language,
+        row.output,
+        row.engine,
+        row.model,
+        row.durationMs != null ? Math.round(row.durationMs) : null,
+      ]
     );
   } catch (err) {
+    // A database problem must never break code generation
     console.error('DB save failed:', err);
   }
 }
@@ -176,13 +191,26 @@ app.post('/api/generate', async (req, res) => {
         client.predict('/generate_code', [`${prompt.trim()} (in ${language})`]),
         120000
       );
-      return res.json({
+
+      const payload = {
         code: String(result?.data?.[0] ?? ''),
         language,
         engine: 'hf-space-qwen-lora',
         model: 'Qwen/Qwen2.5-Coder-0.5B-Instruct + LoRA',
         durationMs: Date.now() - start,
+      };
+
+      // Save prompt + output to the database
+      await saveGeneration({
+        prompt: prompt.trim(),
+        language: payload.language,
+        output: payload.code,
+        engine: payload.engine,
+        model: payload.model,
+        durationMs: payload.durationMs,
       });
+
+      return res.json(payload);
     } catch (err: any) {
       spaceClient = null; // reconnect on the next request
       return res.status(503).json({
@@ -220,13 +248,24 @@ Rules:
       let rawText = (response.text || '').trim();
       const codeBlockMatch = rawText.match(/^```(?:[a-zA-Z0-9_\-+]+)?\n([\s\S]*?)```$/);
       const cleanedCode = codeBlockMatch ? codeBlockMatch[1] : rawText;
+      const durationMs = Date.now() - startTime;
+
+      // Save prompt + output to the database
+      await saveGeneration({
+        prompt: prompt.trim(),
+        language,
+        output: cleanedCode,
+        engine: 'demo-gemini-bridge',
+        model: 'Demo Engine (Gemini 2.5 Flash)',
+        durationMs,
+      });
 
       return res.json({
         code: cleanedCode,
         language,
         engine: 'demo-gemini-bridge',
         model: 'Demo Engine (Gemini 2.5 Flash as Qwen2.5-Coder bridge)',
-        durationMs: Date.now() - startTime,
+        durationMs,
         isDemo: true,
       });
     } catch (geminiError: any) {
@@ -245,6 +284,9 @@ Rules:
 
 // Mount Vite (dev) or the static build (production)
 async function startServer() {
+  // Create the database table on startup (does nothing if it already exists)
+  await initDb().catch((err) => console.error('DB init failed:', err));
+
   if (!isProd) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
