@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://code-gen-ai-final.onrender.com/sitemap.xml
